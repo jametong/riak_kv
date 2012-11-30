@@ -27,7 +27,9 @@
 
 %% API
 -export([test_vnode/1, put/7]).
--export([start_vnode/1,
+-export([add_obj_modified_hook/3,
+         get_state_partition/1,
+         start_vnode/1,
          get/3,
          del/3,
          put/6,
@@ -136,6 +138,16 @@ maybe_create_hashtrees(true, State=#state{idx=Index}) ->
     end.
 
 %% API
+add_obj_modified_hook(Bucket, Mod, Fun) ->
+    BProps = riak_core_bucket:get_bucket(Bucket),
+    Existing = get_obj_modified_hooks(BProps),
+    New = {Mod, Fun},
+    Hooks = lists:usort([New|Existing]),
+    ok = riak_core_bucket:set_bucket(Bucket, [{obj_modified_hooks, Hooks}]).
+
+get_state_partition(#state{idx=Partition}) ->
+    Partition.
+
 start_vnode(I) ->
     riak_core_vnode_master:get_vnode_pid(I, riak_kv_vnode).
 
@@ -629,6 +641,7 @@ handoff_finished(_TargetNode, State) ->
 handle_handoff_data(BinObj, State) ->
     PBObj = riak_core_pb:decode_riakobject_pb(zlib:unzip(BinObj)),
     BKey = {PBObj#riakobject_pb.bucket,PBObj#riakobject_pb.key},
+
     case do_diffobj_put(BKey, binary_to_term(PBObj#riakobject_pb.val), State) of
         {ok, UpdModState} ->
             {reply, ok, State#state{modstate=UpdModState}};
@@ -756,6 +769,9 @@ do_backend_delete(BKey, RObj, State = #state{mod = Mod, modstate = ModState}) ->
     case Mod:delete(Bucket, Key, IndexSpecs, ModState) of
         {ok, UpdModState} ->
             riak_kv_index_hashtree:delete(BKey, State#state.hashtrees),
+            BProps = riak_core_bucket:get_bucket(Bucket),
+            Hooks = get_obj_modified_hooks(BProps),
+            [run_hook(H, RObj, delete, State) || H <- Hooks],
             update_index_delete_stats(IndexSpecs),
             State#state{modstate = UpdModState};
         {error, _Reason, UpdModState} ->
@@ -865,6 +881,9 @@ perform_put({true, Obj},
     case Mod:put(Bucket, Key, IndexSpecs, Val, ModState) of
         {ok, UpdModState} ->
             update_hashtree(Bucket, Key, Val, State),
+            BProps = riak_core_bucket:get_bucket(Bucket),
+            Hooks = get_obj_modified_hooks(BProps),
+            [run_hook(H, Obj, put, State) || H <- Hooks],
             case RB of
                 true ->
                     Reply = {dw, Idx, Obj, ReqID};
@@ -1140,7 +1159,10 @@ do_diffobj_put({Bucket, Key}, DiffObj,
                 {ok, _UpdModState} ->
                     update_hashtree(Bucket, Key, Val, StateData),
                     update_index_write_stats(IndexBackend, IndexSpecs),
-                    update_vnode_stats(vnode_put, Idx, StartTS);
+                    update_vnode_stats(vnode_put, Idx, StartTS),
+                    BProps = riak_core_bucket:get_bucket(Bucket),
+                    Hooks = get_obj_modified_hooks(BProps),
+                    [run_hook(H, DiffObj, handoff, StateData) || H <- Hooks];
                 _ -> nop
             end,
             Res;
@@ -1166,7 +1188,10 @@ do_diffobj_put({Bucket, Key}, DiffObj,
                         {ok, _UpdModState} ->
                             update_hashtree(Bucket, Key, Val, StateData),
                             update_index_write_stats(IndexBackend, IndexSpecs),
-                            update_vnode_stats(vnode_put, Idx, StartTS);
+                            update_vnode_stats(vnode_put, Idx, StartTS),
+                            BProps = riak_core_bucket:get_bucket(Bucket),
+                            Hooks = get_obj_modified_hooks(BProps),
+                            [run_hook(H, AMObj, handoff, StateData) || H <- Hooks];
                         _ ->
                             nop
                     end,
@@ -1321,6 +1346,13 @@ object_info({Bucket, _Key}=BKey) ->
     Hash = riak_core_util:chash_key(BKey),
     {Bucket, Hash}.
 
+%% @private
+run_hook({M, F}, Obj, PutReason, VNodeState) ->
+    M:F(Obj, PutReason, VNodeState).
+
+%% @private
+get_obj_modified_hooks(BProps) ->
+    proplists:get_value(obj_modified_hooks, BProps, []).
 
 -ifdef(TEST).
 
